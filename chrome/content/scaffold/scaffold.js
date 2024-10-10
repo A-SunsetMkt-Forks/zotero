@@ -32,6 +32,12 @@ var { ContentDOMReference } = ChromeUtils.import("resource://gre/modules/Content
 var { Zotero } = ChromeUtils.importESModule("chrome://zotero/content/zotero.mjs");
 var { FilePicker } = ChromeUtils.importESModule('chrome://zotero/content/modules/filePicker.mjs');
 
+var lazy = {};
+ChromeUtils.defineLazyGetter(lazy, 'shellPathPromise', () => {
+	return Zotero.Utilities.Internal.subprocess(Services.env.get('SHELL'), ['-c', 'echo $PATH'])
+		.then(s => s.trimEnd());
+});
+
 // Fix JSON stringify 2028/2029 "bug"
 // Borrowed from http://stackoverflow.com/questions/16686687/json-stringify-and-u2028-u2029-check
 if (JSON.stringify(["\u2028\u2029"]) !== '["\\u2028\\u2029"]') {
@@ -97,6 +103,15 @@ var Scaffold = new function () {
 		});
 
 		document.getElementById('tabpanels').addEventListener('select', event => Scaffold.handleTabSelect(event));
+		document.getElementById('tabs').addEventListener('mousedown', (event) => {
+			// Record if tab selection will happen due to a mouse click vs keyboard nav.
+			if (event.clientX === 0 && event.clientY === 0) return;
+			document.getElementById('tabs').setAttribute("clicked", true);
+		}, true);
+		// Record that click has happened for better focus-ring handling in the stylesheet
+		document.addEventListener("mouseup", (_) => {
+			document.getElementById('tabs').removeAttribute("clicked");
+		});
 		
 		let lastTranslatorID = Zotero.Prefs.get('scaffold.lastTranslatorID');
 		if (lastTranslatorID) {
@@ -150,6 +165,10 @@ var Scaffold = new function () {
 		this.initImportEditor();
 		this.initCodeEditor();
 		this.initTestsEditor();
+
+		this.addEditorKeydownHandlers(_editors.import);
+		this.addEditorKeydownHandlers(_editors.code);
+		this.addEditorKeydownHandlers(_editors.tests);
 
 		// Set font size from general pref
 		Zotero.UIProperties.registerRoot(document.getElementById('scaffold-pane'));
@@ -858,24 +877,31 @@ var Scaffold = new function () {
 			return;
 		}
 
-		// Focus editor when switching to tab
 		var tab = document.getElementById('tabs').selectedItem.id.match(/^tab-(.+)$/)[1];
-		switch (tab) {
-			case 'import':
-			case 'code':
-			case 'tests':
-				// the select event's default behavior is to focus the selected tab.
-				// we don't want to prevent *all* of the event's default behavior,
-				// but we do want to focus the editor instead of the tab.
-				// so this stupid hack waits 10 ms for event processing to finish
-				// before focusing the editor.
-				setTimeout(() => {
-					document.getElementById(`editor-${tab}`).focus();
-					_editors[tab].focus();
-				}, 10);
-				break;
+		let tabPanel = document.getElementById("left-tabbox").selectedPanel;
+		// The select event's default behavior is to focus the selected tab.
+		// we don't want to prevent *all* of the event's default behavior,
+		// but we do want to focus an element inside of tabpanel instead of the tab
+		// (unless tabs are being navigated via keyboard)
+		// so this stupid hack focuses the desired element after skipping a tick
+		if (document.getElementById('tabs').getAttribute("clicked")) {
+			setTimeout(() => {
+				let toFocus = tabPanel.querySelector("[focus-on-tab-select]");
+				if (toFocus) {
+					toFocus.focus();
+					// activate editor that is being focused, if any
+					if (toFocus.src.includes("monaco.html")) {
+						_editors[tab].focus();
+					}
+				}
+				else {
+					// if no specific element set, just tab into the panel
+					setTimeout(() => {
+						Services.focus.moveFocus(window, document.getElementById('tabs').selectedItem, Services.focus.MOVEFOCUS_FORWARD, 0);
+					});
+				}
+			});
 		}
-
 		let codeTabBroadcaster = document.getElementById('code-tab-only');
 		if (tab == 'code') {
 			codeTabBroadcaster.removeAttribute('disabled');
@@ -900,6 +926,31 @@ var Scaffold = new function () {
 			openURL.setAttribute('disabled', true);
 		}
 	};
+
+	// Add special keydown handling for the editors
+	this.addEditorKeydownHandlers = function (editor) {
+		let doc = editor.getDomNode().ownerDocument;
+		let tabbox = document.getElementById("left-tabbox");
+		// On shift-tab from the start of the first line, tab out of the editor.
+		// Use capturing listener, since Shift-Tab keydown events do not propagate to the document.
+		doc.addEventListener("keydown", (event) => {
+			if (event.key == "Tab" && event.shiftKey) {
+				let position = editor.getPosition();
+				if (position.column == 1 && position.lineNumber == 1) {
+					Services.focus.moveFocus(window, event.target, Services.focus.MOVEFOCUS_BACKWARD, 0);
+					event.preventDefault();
+				}
+			}
+		}, true);
+		// On Escape, focus the selected tab. Use non-capturing listener to not
+		// do anything on Escape events handled by the editor (e.g. to dismiss autocomplete popup)
+		doc.addEventListener("keydown", (event) => {
+			if (event.key == "Escape") {
+				tabbox.selectedTab.focus();
+			}
+		});
+	};
+
 
 	this.listFieldsForItemType = function (itemType) {
 		var outputObject = {};
@@ -1788,7 +1839,7 @@ var Scaffold = new function () {
 		for (let i = 0; i < count; i++) {
 			let item = listBox.getItemAtIndex(i);
 			let [, statusCell] = item.children;
-			oldStatuses[item.dataset.testString] = statusCell.getAttribute('value');
+			oldStatuses[item.dataset.testString] = statusCell.textContent;
 		}
 
 		let testIndex = 0;
@@ -2228,7 +2279,7 @@ var Scaffold = new function () {
 	}
 
 	function getDefaultESLintPath() {
-		return PathUtils.join(Scaffold_Translators.getDirectory(), 'node_modules', '.bin', 'teslint');
+		return PathUtils.join(Scaffold_Translators.getDirectory(), 'node_modules', '.bin', 'eslint');
 	}
 
 	async function getESLintPath() {
@@ -2249,7 +2300,7 @@ var Scaffold = new function () {
 				"Zotero uses ESLint to enable code suggestions and error checking, "
 					+ "but it wasn't found in the selected translators directory.\n\n"
 					+ "You can install it from the command line:\n\n"
-					+ `  cd ${Scaffold_Translators.getDirectory()}\n`
+					+ `  cd '${Scaffold_Translators.getDirectory()}'\n`
 					+ "  npm install\n\n",
 				buttonFlags,
 				"Try Again",
@@ -2271,11 +2322,12 @@ var Scaffold = new function () {
 		let eslintPath = await getESLintPath();
 		if (!eslintPath) return [];
 
-		Zotero.debug('Running ESLint');
 		try {
 			let metadata = _getMetadataObject();
 			let code = _getCode();
-			let proc = await Subprocess.call({
+			let translatorString = _translatorProvider.stringify(metadata, code);
+			
+			let subprocessOptions = {
 				command: eslintPath,
 				arguments: [
 					'--format',
@@ -2284,14 +2336,27 @@ var Scaffold = new function () {
 					'--stdin-filename',
 					_translatorProvider.getSavePath(metadata)
 				],
-			});
-			await proc.stdin.write(_translatorProvider.stringify(metadata, code));
+			};
+			
+			// ESLint needs to find node on the PATH, but macOS doesn't forward
+			// the login shell's PATH to GUI processes by default. There's a
+			// launchctl command that fixes it, but we can't expect people
+			// to do that. Pass the login shell's PATH as a workaround.
+			if (Zotero.isMac) {
+				subprocessOptions.environment = { PATH: await lazy.shellPathPromise };
+				subprocessOptions.environmentAppend = true;
+			}
+			
+			let proc = await Subprocess.call(subprocessOptions);
+			
+			await proc.stdin.write(translatorString);
 			await proc.stdin.close();
 			let lintOutput = '';
 			let chunk;
 			while ((chunk = await proc.stdout.readString())) {
 				lintOutput += chunk;
 			}
+			proc.kill(); // Shouldn't be necessary, but make sure we don't leak
 			return JSON.parse(lintOutput);
 		}
 		catch (e) {
